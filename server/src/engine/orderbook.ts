@@ -6,6 +6,10 @@
 export type Side = "buy" | "sell";
 export type OrderType = "limit" | "market";
 
+export class SelfTradeError extends Error {
+  constructor() { super("Self-trade is not allowed"); }
+}
+
 export interface Order {
   id: string;
   owner: string;       // 钱包地址（小写）
@@ -45,6 +49,7 @@ export class OrderBook {
 
   /** 提交订单：先吃对手盘，limit 剩余挂单，market 剩余丢弃 */
   submit(input: Omit<Order, "remaining" | "seq" | "ts"> & Partial<Pick<Order, "ts">>): { fills: Fill[]; resting: Order | null } {
+    this.rejectSelfTrade(input);
     const order: Order = { ...input, remaining: input.qty, seq: ++this.seq, ts: input.ts ?? Date.now() };
     const fills = this.match(order);
 
@@ -95,6 +100,21 @@ export class OrderBook {
 
   // ---------- 内部实现 ----------
 
+  /** 只读预检实际成交路径；发现自成交则整单拒绝，不改变任何挂单。 */
+  private rejectSelfTrade(taker: Pick<Order, "owner" | "side" | "type" | "price" | "qty">): void {
+    const opposite = this.sideOf(taker.side === "buy" ? "sell" : "buy");
+    let remaining = taker.qty;
+    for (const price of opposite.prices) {
+      if (remaining <= 0n) return;
+      if (taker.type === "limit" && !this.crosses(taker.side, taker.price, price)) return;
+      for (const maker of opposite.book.get(price)!.orders) {
+        if (remaining <= 0n) return;
+        if (maker.owner.toLowerCase() === taker.owner.toLowerCase()) throw new SelfTradeError();
+        remaining -= remaining < maker.remaining ? remaining : maker.remaining;
+      }
+    }
+  }
+
   /** 撮合：买单看 asks（从低到高），卖单看 bids（从高到低） */
   private match(taker: Order): Fill[] {
     const fills: Fill[] = [];
@@ -108,7 +128,6 @@ export class OrderBook {
       const level = opposite.book.get(bestPrice)!;
       while (taker.remaining > 0n && level.orders.length > 0) {
         const maker = level.orders[0]!;
-        // TODO 生产环境需要 self-trade prevention（自成交会刷量，这里为了简单允许）
         const qty = taker.remaining < maker.remaining ? taker.remaining : maker.remaining;
         taker.remaining -= qty;
         maker.remaining -= qty;

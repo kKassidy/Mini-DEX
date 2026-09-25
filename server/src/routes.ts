@@ -3,7 +3,7 @@
 // buy limit 冻结 price*qty USDC；buy market 冻结全部可用 USDC；sell 冻结 qty WAVAX。
 import { Hono } from "hono";
 import { randomBytes, randomUUID } from "node:crypto";
-import { OrderBook, type Fill, type Order, type OrderType, type Side } from "./engine/orderbook.js";
+import { OrderBook, SelfTradeError, type Fill, type Order, type OrderType, type Side } from "./engine/orderbook.js";
 import { Ledger, type Asset, type Balances } from "./ledger.js";
 import { parseFixed, formatFixed, mulFixed } from "./fixed.js";
 import type { AuthEnv } from "./auth.js";
@@ -114,7 +114,14 @@ export function createRoutes(d: RoutesDeps) {
     }
 
     // 2. 撮合
-    const { fills, resting } = book.submit({ id, owner, side, type, price, qty });
+    let result: ReturnType<OrderBook["submit"]>;
+    try {
+      result = book.submit({ id, owner, side, type, price, qty });
+    } catch (e) {
+      if (e instanceof SelfTradeError) releaseLock(id, owner, side);
+      throw e;
+    }
+    const { fills, resting } = result;
 
     // 3. 结算每笔成交
     for (const f of fills) settle(f);

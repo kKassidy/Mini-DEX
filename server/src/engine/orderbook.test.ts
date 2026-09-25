@@ -1,6 +1,6 @@
 // 撮合引擎单元测试（vitest）。每个 case 对应一条撮合规则，先看测试再看实现更好懂。
 import { describe, it, expect } from "vitest";
-import { OrderBook, type Side, type OrderType } from "./orderbook.js";
+import { OrderBook, SelfTradeError, type Side, type OrderType } from "./orderbook.js";
 import { parseFixed as F } from "../fixed.js";
 
 let n = 0;
@@ -11,6 +11,68 @@ const limit = (owner: string, side: Side, price: string, qty: string) => order(o
 const market = (owner: string, side: Side, qty: string) => order(owner, side, "market", "0", qty);
 
 describe("OrderBook", () => {
+  it.each(["buy", "sell"] as const)("partial-fill FIFO: resting %s keeps its position", (side) => {
+    const ob = new OrderBook();
+    const opposite = side === "buy" ? "sell" : "buy";
+    const first = ob.submit(limit("a", side, "100", "3")).resting!;
+    const second = ob.submit(limit("b", side, "100", "2")).resting!;
+    expect(ob.submit(market("t", opposite, "1")).fills.map(f => [f.makerOrderId, f.qty]))
+      .toEqual([[first.id, F("1")]]);
+    expect(first.remaining).toBe(F("2"));
+    expect(ob.submit(market("t", opposite, "3")).fills.map(f => [f.makerOrderId, f.qty]))
+      .toEqual([[first.id, F("2")], [second.id, F("1")]]);
+    expect(ob.get(first.id)).toBeUndefined();
+    expect(ob.get(second.id)?.remaining).toBe(F("1"));
+  });
+
+  describe.each(["buy", "sell"] as const)("self-trade: %s taker", (side) => {
+    const opposite = side === "buy" ? "sell" : "buy";
+    it.each(["limit", "market"] as const)("rejects %s when own maker is first", (type) => {
+      const ob = new OrderBook();
+      const own = ob.submit(limit("alice", opposite, "100", "2")).resting!;
+      const before = structuredClone(own);
+      expect(() => ob.submit(order("alice", side, type, "100", "1"))).toThrow(SelfTradeError);
+      expect(ob.get(own.id)).toEqual(before);
+      expect(ob.ordersOf("alice")).toEqual([before]);
+    });
+
+    it.each(["limit", "market"] as const)("rejects %s atomically after earlier third-party liquidity", (type) => {
+      const ob = new OrderBook();
+      const first = ob.submit(limit("other", opposite, side === "buy" ? "99" : "101", "1")).resting!;
+      const own = ob.submit(limit("0xAbC", opposite, "100", "2")).resting!;
+      const before = structuredClone([first, own]);
+      const depth = ob.snapshot();
+      const incoming = order("0xabc", side, type, "100", "2");
+      expect(() => ob.submit(incoming)).toThrow(SelfTradeError);
+      expect(ob.snapshot()).toEqual(depth);
+      expect([ob.get(first.id), ob.get(own.id)]).toEqual(before);
+      expect(ob.get(incoming.id)).toBeUndefined();
+      const next = ob.submit(limit("other", opposite, "100", "1")).resting!;
+      expect(next.seq).toBe(own.seq + 1);
+    });
+
+    it.each(["limit", "market"] as const)("allows %s satisfied before own same-price liquidity", (type) => {
+      const ob = new OrderBook();
+      const first = ob.submit(limit("other", opposite, "100", "2")).resting!;
+      const own = ob.submit(limit("alice", opposite, "100", "1")).resting!;
+      // Leave a partially filled maker ahead of the own order.
+      ob.submit(market("third", side, "1"));
+      const r = ob.submit(order("alice", side, type, "100", "1"));
+      expect(r.fills.map(f => [f.makerOrderId, f.qty])).toEqual([[first.id, F("1")]]);
+      expect(r.resting).toBeNull();
+      expect(ob.get(own.id)?.remaining).toBe(F("1"));
+    });
+
+    it("allows own liquidity beyond the limit price", () => {
+      const ob = new OrderBook();
+      const own = ob.submit(limit("alice", opposite, side === "buy" ? "101" : "99", "1")).resting!;
+      const r = ob.submit(limit("alice", side, "100", "1"));
+      expect(r.fills).toEqual([]);
+      expect(r.resting?.remaining).toBe(F("1"));
+      expect(ob.get(own.id)?.remaining).toBe(F("1"));
+    });
+  });
+
   it("空簿：limit 单直接挂上", () => {
     const ob = new OrderBook();
     const r = ob.submit(limit("alice", "sell", "100", "1"));
