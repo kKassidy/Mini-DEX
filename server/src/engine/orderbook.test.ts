@@ -205,3 +205,89 @@ describe("OrderBook", () => {
     expect(ob.ordersOf("b")).toHaveLength(1);
   });
 });
+
+describe.each(["buy", "sell"] as const)("time in force: %s", (side) => {
+  const opposite = side === "buy" ? "sell" : "buy";
+  const better = side === "buy" ? "99" : "101";
+  const worse = side === "buy" ? "101" : "99";
+  const incoming = (timeInForce: "IOC" | "FOK", qty = "3") => ({
+    ...limit("taker", side, "100", qty), timeInForce,
+  });
+
+  it.each(["IOC", "FOK"] as const)("%s fills across prices and same-price FIFO makers", (tif) => {
+    const ob = new OrderBook();
+    const first = ob.submit(limit("a", opposite, better, "1")).resting!;
+    const second = ob.submit(limit("b", opposite, "100", "1")).resting!;
+    const third = ob.submit(limit("c", opposite, "100", "2")).resting!;
+    const r = ob.submit(incoming(tif));
+    expect(r.resting).toBeNull();
+    expect(r.fills.map(f => [f.makerOrderId, f.price, f.qty])).toEqual([
+      [first.id, F(better), F("1")], [second.id, F("100"), F("1")], [third.id, F("100"), F("1")],
+    ]);
+    expect(ob.get(third.id)?.remaining).toBe(F("1"));
+    expect(ob.ordersOf("taker")).toEqual([]);
+  });
+
+  it("IOC fills only eligible liquidity and never rests its remainder", () => {
+    const ob = new OrderBook();
+    const eligible = ob.submit(limit("a", opposite, better, "1")).resting!;
+    const outside = ob.submit(limit("b", opposite, worse, "5")).resting!;
+    const before = structuredClone(outside);
+    const r = ob.submit(incoming("IOC"));
+    expect(r.fills.map(f => [f.makerOrderId, f.qty])).toEqual([[eligible.id, F("1")]]);
+    expect(r.resting).toBeNull();
+    expect(ob.get(outside.id)).toEqual(before);
+    expect(ob.ordersOf("taker")).toEqual([]);
+  });
+
+  it.each(["IOC", "FOK"] as const)("%s on an empty book does not rest", (tif) => {
+    const ob = new OrderBook();
+    expect(ob.submit(incoming(tif))).toEqual({ fills: [], resting: null });
+    expect(ob.snapshot()).toEqual({ bids: [], asks: [] });
+  });
+
+  it("FOK ignores out-of-limit depth and kills before any mutation or sequence allocation", () => {
+    const ob = new OrderBook();
+    const first = ob.submit(limit("a", opposite, better, "1")).resting!;
+    const last = ob.submit(limit("b", opposite, worse, "10")).resting!;
+    const before = structuredClone([first, last]);
+    const depth = ob.snapshot();
+    const input = incoming("FOK");
+    expect(ob.submit(input)).toEqual({ fills: [], resting: null });
+    expect([ob.get(first.id), ob.get(last.id)]).toEqual(before);
+    expect(ob.snapshot()).toEqual(depth);
+    expect(ob.get(input.id)).toBeUndefined();
+    const next = ob.submit(limit("c", opposite, worse, "1")).resting!;
+    expect(next.seq).toBe(last.seq + 1);
+    expect(ob.submit(incoming("IOC", "1")).fills[0].makerOrderId).toBe(first.id);
+  });
+
+  it.each(["IOC", "FOK"] as const)("%s rejects own liquidity after another maker atomically", (tif) => {
+    const ob = new OrderBook();
+    const first = ob.submit(limit("a", opposite, better, "1")).resting!;
+    const own = ob.submit(limit("TaKeR", opposite, "100", "1")).resting!;
+    const before = structuredClone([first, own]);
+    const depth = ob.snapshot();
+    // FOK is also insufficient: self-trade must still be detected.
+    expect(() => ob.submit(incoming(tif))).toThrow(SelfTradeError);
+    expect([ob.get(first.id), ob.get(own.id)]).toEqual(before);
+    expect(ob.snapshot()).toEqual(depth);
+    const next = ob.submit(limit("c", opposite, worse, "1")).resting!;
+    expect(next.seq).toBe(own.seq + 1);
+  });
+
+  it.each(["IOC", "FOK"] as const)("%s allows own liquidity beyond the needed FIFO quantity", (tif) => {
+    const ob = new OrderBook();
+    const first = ob.submit(limit("a", opposite, "100", "3")).resting!;
+    const own = ob.submit(limit("taker", opposite, "100", "1")).resting!;
+    expect(ob.submit(incoming(tif)).fills.map(f => f.makerOrderId)).toEqual([first.id]);
+    expect(own.remaining).toBe(F("1"));
+  });
+
+  it.each(["IOC", "FOK"] as const)("%s allows own liquidity outside the price limit", (tif) => {
+    const ob = new OrderBook();
+    const own = ob.submit(limit("taker", opposite, worse, "10")).resting!;
+    expect(ob.submit(incoming(tif))).toEqual({ fills: [], resting: null });
+    expect(ob.get(own.id)?.remaining).toBe(F("10"));
+  });
+});

@@ -6,6 +6,7 @@ export type Address = `0x${string}`;
 export type TokenSymbol = "USDC" | "WAVAX";
 export type Side = "buy" | "sell";
 export type OrderType = "limit" | "market";
+export type TimeInForce = "GTC" | "IOC" | "FOK";
 
 export interface Config {
   chainId: number;
@@ -42,6 +43,7 @@ export interface Order {
   owner: string;
   side: Side;
   type: OrderType;
+  timeInForce?: TimeInForce;
   price: string;
   qty: string;
   remaining: string;
@@ -62,6 +64,7 @@ export interface Fill {
 export interface PlaceOrderBody {
   side: Side;
   type: OrderType;
+  timeInForce?: TimeInForce;
   price?: string;
   qty: string;
 }

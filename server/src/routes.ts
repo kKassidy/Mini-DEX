@@ -3,7 +3,7 @@
 // buy limit 冻结 price*qty USDC；buy market 冻结全部可用 USDC；sell 冻结 qty WAVAX。
 import { Hono } from "hono";
 import { randomBytes, randomUUID } from "node:crypto";
-import { OrderBook, SelfTradeError, type Fill, type Order, type OrderType, type Side } from "./engine/orderbook.js";
+import { OrderBook, SelfTradeError, normalizeTimeInForce, type TimeInForce, type Fill, type Order, type OrderType, type Side } from "./engine/orderbook.js";
 import { Ledger, type Asset, type Balances } from "./ledger.js";
 import { parseFixed, formatFixed, mulFixed } from "./fixed.js";
 import type { AuthEnv } from "./auth.js";
@@ -36,7 +36,7 @@ export function createRoutes(d: RoutesDeps) {
     WAVAX: { available: formatFixed(b.WAVAX.available), locked: formatFixed(b.WAVAX.locked) },
   });
   const fmtOrder = (o: Order) => ({
-    id: o.id, owner: o.owner, side: o.side, type: o.type,
+    id: o.id, owner: o.owner, side: o.side, type: o.type, timeInForce: normalizeTimeInForce(o.type, o.timeInForce),
     price: formatFixed(o.price), qty: formatFixed(o.qty), remaining: formatFixed(o.remaining), ts: o.ts,
   });
   const fmtFill = (f: Fill) => ({ ...f, price: formatFixed(f.price), qty: formatFixed(f.qty) });
@@ -93,10 +93,11 @@ export function createRoutes(d: RoutesDeps) {
   /** 下单：冻结 -> 撮合 -> 结算 -> 解冻 -> 广播。余额不足等直接抛 Error。 */
   function placeOrder(
     owner: string,
-    input: { side: Side; type: OrderType; price: bigint; qty: bigint },
+    input: { side: Side; type: OrderType; price: bigint; qty: bigint; timeInForce?: TimeInForce },
     opts: { broadcastBook?: boolean } = {},
   ): { order: Order; fills: Fill[] } {
     const { side, type, price, qty } = input;
+    const timeInForce = normalizeTimeInForce(type, input.timeInForce);
     const id = randomUUID();
     // 1. 冻结
     if (side === "sell") {
@@ -116,7 +117,7 @@ export function createRoutes(d: RoutesDeps) {
     // 2. 撮合
     let result: ReturnType<OrderBook["submit"]>;
     try {
-      result = book.submit({ id, owner, side, type, price, qty });
+      result = book.submit({ id, owner, side, type, price, qty, timeInForce });
     } catch (e) {
       if (e instanceof SelfTradeError) releaseLock(id, owner, side);
       throw e;
@@ -150,7 +151,7 @@ export function createRoutes(d: RoutesDeps) {
     pushBalance(owner);
     for (const maker of new Set(fills.map((f) => f.maker))) if (maker !== owner) pushBalance(maker);
 
-    const order: Order = resting ?? { id, owner, side, type, price, qty, remaining: qty - fills.reduce((s, f) => s + f.qty, 0n), ts: fills[0]?.ts ?? Date.now(), seq: 0 };
+    const order: Order = resting ?? { id, owner, side, type, timeInForce, price, qty, remaining: qty - fills.reduce((s, f) => s + f.qty, 0n), ts: fills[0]?.ts ?? Date.now(), seq: 0 };
     return { order, fills };
   }
 
@@ -188,10 +189,14 @@ export function createRoutes(d: RoutesDeps) {
 
   app.post("/orders", d.bearer, async (c) => {
     const owner = c.get("address");
-    const body = await c.req.json<{ side?: string; type?: string; price?: string; qty?: string }>().catch(() => ({}) as Record<string, string>);
+    const body = await c.req.json<{ side?: string; type?: string; price?: string; qty?: string; timeInForce?: unknown }>().catch(() => ({}) as Record<string, string>);
     const { side, type } = body;
     if (side !== "buy" && side !== "sell") return c.json({ error: "side 必须是 buy / sell" }, 400);
     if (type !== "limit" && type !== "market") return c.json({ error: "type 必须是 limit / market" }, 400);
+
+    let timeInForce: TimeInForce;
+    try { timeInForce = normalizeTimeInForce(type, body.timeInForce); }
+    catch (e) { return c.json({ error: (e as Error).message }, 400); }
 
     let qty: bigint, price = 0n;
     try {
@@ -202,7 +207,7 @@ export function createRoutes(d: RoutesDeps) {
     if (type === "limit" && price <= 0n) return c.json({ error: "limit 单必须给 price" }, 400);
 
     try {
-      const { order, fills } = placeOrder(owner, { side, type, price, qty });
+      const { order, fills } = placeOrder(owner, { side, type, price, qty, timeInForce });
       return c.json({ order: fmtOrder(order), fills: fills.map(fmtFill) });
     } catch (e) { return c.json({ error: (e as Error).message }, 400); }
   });

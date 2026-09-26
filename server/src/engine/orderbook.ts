@@ -5,6 +5,15 @@
 
 export type Side = "buy" | "sell";
 export type OrderType = "limit" | "market";
+export type TimeInForce = "GTC" | "IOC" | "FOK";
+
+/** Shared runtime validation; callers must validate before reserving funds. */
+export function normalizeTimeInForce(type: OrderType, value?: unknown): TimeInForce {
+  if (value === undefined) return type === "limit" ? "GTC" : "IOC";
+  if (value !== "GTC" && value !== "IOC" && value !== "FOK") throw new Error("Invalid timeInForce");
+  if (type === "market" && value !== "IOC") throw new Error("Market orders only support IOC");
+  return value;
+}
 
 export class SelfTradeError extends Error {
   constructor() { super("Self-trade is not allowed"); }
@@ -15,6 +24,7 @@ export interface Order {
   owner: string;       // 钱包地址（小写）
   side: Side;
   type: OrderType;
+  timeInForce?: TimeInForce;
   price: bigint;       // 8 位定点；market 单为 0n
   qty: bigint;         // 原始数量
   remaining: bigint;   // 还没成交的数量
@@ -47,17 +57,19 @@ export class OrderBook {
   private byId = new Map<string, Order>();
   private seq = 0;
 
-  /** 提交订单：先吃对手盘，limit 剩余挂单，market 剩余丢弃 */
+  /** Match immediately; only GTC limits rest. FOK preflight never mutates the book. */
   submit(input: Omit<Order, "remaining" | "seq" | "ts"> & Partial<Pick<Order, "ts">>): { fills: Fill[]; resting: Order | null } {
-    this.rejectSelfTrade(input);
-    const order: Order = { ...input, remaining: input.qty, seq: ++this.seq, ts: input.ts ?? Date.now() };
+    const timeInForce = normalizeTimeInForce(input.type, input.timeInForce);
+    const unfilled = this.preflight(input);
+    if (timeInForce === "FOK" && unfilled > 0n) return { fills: [], resting: null };
+    const order: Order = { ...input, timeInForce, remaining: input.qty, seq: ++this.seq, ts: input.ts ?? Date.now() };
     const fills = this.match(order);
 
-    if (order.type === "limit" && order.remaining > 0n) {
+    if (order.type === "limit" && timeInForce === "GTC" && order.remaining > 0n) {
       this.rest(order);
       return { fills, resting: order };
     }
-    return { fills, resting: null }; // market 单不挂；或者 limit 单已全部成交
+    return { fills, resting: null }; // IOC/FOK never rest; GTC may be fully filled.
   }
 
   /** 撤单：只能撤自己的；返回被撤的订单（找不到返回 null） */
@@ -100,19 +112,20 @@ export class OrderBook {
 
   // ---------- 内部实现 ----------
 
-  /** 只读预检实际成交路径；发现自成交则整单拒绝，不改变任何挂单。 */
-  private rejectSelfTrade(taker: Pick<Order, "owner" | "side" | "type" | "price" | "qty">): void {
+  /** Read the execution path without mutation: reject self-trades and return unfilled quantity. */
+  private preflight(taker: Pick<Order, "owner" | "side" | "type" | "price" | "qty">): bigint {
     const opposite = this.sideOf(taker.side === "buy" ? "sell" : "buy");
     let remaining = taker.qty;
     for (const price of opposite.prices) {
-      if (remaining <= 0n) return;
-      if (taker.type === "limit" && !this.crosses(taker.side, taker.price, price)) return;
+      if (remaining <= 0n) return remaining;
+      if (taker.type === "limit" && !this.crosses(taker.side, taker.price, price)) return remaining;
       for (const maker of opposite.book.get(price)!.orders) {
-        if (remaining <= 0n) return;
+        if (remaining <= 0n) return remaining;
         if (maker.owner.toLowerCase() === taker.owner.toLowerCase()) throw new SelfTradeError();
         remaining -= remaining < maker.remaining ? remaining : maker.remaining;
       }
     }
+    return remaining;
   }
 
   /** 撮合：买单看 asks（从低到高），卖单看 bids（从高到低） */
