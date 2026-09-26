@@ -70,7 +70,11 @@ export function createChain(cfg: ChainConfig) {
         const asset = assetOf(token);
         if (!asset) continue;
         const fixed = weiToFixed(amount, TOKEN_DECIMALS[asset]);
-        if (log.eventName === "Deposit") { onDeposit(user, asset, fixed); deposits++; }
+        if (log.eventName === "Deposit") {
+          if (fixed === 0n) continue;
+          onDeposit(user, asset, fixed);
+          deposits++;
+        }
         else { onWithdraw(user, asset, fixed); withdraws++; }
       }
     }
@@ -107,6 +111,7 @@ export function createChain(cfg: ChainConfig) {
             const asset = assetOf(token);
             if (!asset) { console.warn(`[chain] 未知代币 ${token}，忽略`); continue; }
             const fixed = weiToFixed(amount, TOKEN_DECIMALS[asset]);
+            if (fixed === 0n) continue;
             console.log(`[chain] Deposit ${user} ${asset} ${amount} wei (tx ${log.transactionHash})`);
             onDeposit(user, asset, fixed);
           }
